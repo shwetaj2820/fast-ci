@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Blast Radius Selector: Optimized test impact analyzer and worker scheduler."""
+"""Blast Radius Selector X2: High-precision test impact analyzer & optimal worker scheduler."""
 
 from __future__ import annotations
 
@@ -69,7 +69,86 @@ def is_pure_comment_or_whitespace(files: dict) -> bool:
     return True
 
 
-def select_tests_for_patch(patch_text: str, cov: dict, tests_meta: list[dict]) -> set[int]:
+def get_targeted_fallback(file_path: str, cov: dict, fast_file_tests: dict) -> set[int]:
+    """Fast, sub-second targeted test suite for any file in sqlglot if line-coverage returns empty."""
+    target = set()
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    file_to_tests = cov.get("file_to_tests", {})
+    dialect_to_opt_tests = cov.get("dialect_to_opt_tests", {})
+    fix_to_opt_test = cov.get("fix_to_opt_test", {})
+    opt_test_map = cov.get("opt_test_map", {})
+
+    if file_path.startswith("sqlglot/dialects/") or file_path.startswith("sqlglot/parsers/") or file_path.startswith("sqlglot/generators/"):
+        dtest = f"tests/dialects/test_{base_name}.py"
+        target.update(file_to_tests.get(dtest, ()))
+        if base_name in dialect_to_opt_tests:
+            target.update(dialect_to_opt_tests[base_name])
+
+    elif file_path.startswith("sqlglot/optimizer/"):
+        if base_name in fix_to_opt_test and fix_to_opt_test[base_name] is not None:
+            target.add(fix_to_opt_test[base_name])
+        for m in ("test_optimize", "test_tpch", "test_tpcds"):
+            if m in opt_test_map:
+                target.add(opt_test_map[m])
+
+    elif file_path.startswith("sqlglot/expressions/"):
+        target.update(file_to_tests.get("tests/test_expressions.py", ()))
+
+    elif file_path in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py"):
+        target.update(file_to_tests.get("tests/test_tokens.py", ()))
+
+    elif file_path == "sqlglot/transforms.py":
+        target.update(file_to_tests.get("tests/test_transforms.py", ()))
+
+    elif file_path == "sqlglot/diff.py":
+        target.update(file_to_tests.get("tests/test_diff.py", ()))
+
+    elif file_path == "sqlglot/schema.py":
+        target.update(file_to_tests.get("tests/test_schema.py", ()))
+
+    elif file_path == "sqlglot/lineage.py":
+        target.update(file_to_tests.get("tests/test_lineage.py", ()))
+
+    elif file_path == "sqlglot/jsonpath.py":
+        target.update(file_to_tests.get("tests/test_jsonpath.py", ()))
+
+    elif file_path == "sqlglot/anonymize.py":
+        target.update(file_to_tests.get("tests/test_anonymize.py", ()))
+
+    elif file_path == "sqlglot/serde.py":
+        target.update(file_to_tests.get("tests/test_serde.py", ()))
+        for m in ("test_canonicalize", "test_optimize"):
+            if m in opt_test_map:
+                target.add(opt_test_map[m])
+
+    elif file_path.startswith("sqlglot/executor/") or file_path == "sqlglot/planner.py":
+        executor_key_tests = cov.get("executor_key_tests", [])
+        target.update(executor_key_tests)
+        target.update(fast_file_tests.get("tests/test_executor.py", ())[:10])
+
+    elif file_path == "sqlglot/time.py":
+        target.update(file_to_tests.get("tests/test_time.py", ()))
+
+    elif file_path == "sqlglot/errors.py":
+        target.update(file_to_tests.get("tests/test_errors.py", ()))
+
+    elif file_path in ("sqlglot/parser.py", "sqlglot/parsers/base.py"):
+        # Select fastest parser tests (<1.0s), never the full 309s file!
+        target.update(fast_file_tests.get("tests/test_parser.py", ()))
+
+    elif file_path == "sqlglot/generator.py":
+        target.update(fast_file_tests.get("tests/test_generator.py", ()))
+
+    else:
+        for tf, tnums in file_to_tests.items():
+            if base_name in tf:
+                target.update(tnums[:5])
+                break
+
+    return target
+
+
+def select_tests_for_patch(patch_text: str, cov: dict, fast_file_tests: dict) -> set[int]:
     files = parse_patch(patch_text)
     if is_pure_comment_or_whitespace(files):
         return set()
@@ -86,15 +165,17 @@ def select_tests_for_patch(patch_text: str, cov: dict, tests_meta: list[dict]) -
     selected = set()
 
     for fn, (hunks, dlines) in files.items():
+        file_selected = set()
+
         if fn.startswith("tests/fixtures/"):
             rel_fix = fn.replace("tests/fixtures/", "")
-            selected.update(fixture_to_tests.get(rel_fix, ()))
+            file_selected.update(fixture_to_tests.get(rel_fix, ()))
             fix_base = os.path.splitext(os.path.basename(fn))[0]
             if fix_base in fix_to_opt_test and fix_to_opt_test[fix_base] is not None:
-                selected.add(fix_to_opt_test[fix_base])
+                file_selected.add(fix_to_opt_test[fix_base])
 
         elif fn.startswith("tests/"):
-            selected.update(file_to_tests.get(fn, ()))
+            file_selected.update(file_to_tests.get(fn, ()))
 
         else:
             file_lines = line_to_tests.get(fn, {})
@@ -103,51 +184,71 @@ def select_tests_for_patch(patch_text: str, cov: dict, tests_meta: list[dict]) -
             for old_start, old_len, new_start, new_len in hunks:
                 # Direct lines hit around hunk
                 for l in range(old_start - 2, old_start + max(old_len, 1) + 3):
-                    selected.update(file_lines.get(str(l), ()))
+                    file_selected.update(file_lines.get(str(l), ()))
 
-                # Smallest enclosing function
+                # Smallest enclosing function (sorted by span ascending)
+                hunk_start = old_start
+                hunk_end = old_start + (max(old_len, 1) - 1 if old_len > 0 else 1)
                 for f_info in file_funcs:
-                    if not (old_start + max(old_len, 1) < f_info["start"] or old_start > f_info["end"]):
-                        selected.update(f_info["tests"])
+                    if not (hunk_end < f_info["start"] or hunk_start > f_info["end"]):
+                        file_selected.update(f_info["tests"])
                         break
 
             # Structural dependency mappings
             if fn.startswith("sqlglot/optimizer/"):
                 base = os.path.splitext(os.path.basename(fn))[0]
                 if base in fix_to_opt_test and fix_to_opt_test[base] is not None:
-                    selected.add(fix_to_opt_test[base])
+                    file_selected.add(fix_to_opt_test[base])
 
                 for mname in ("test_optimize", "test_tpch", "test_tpcds"):
                     if mname in opt_test_map:
-                        selected.add(opt_test_map[mname])
+                        file_selected.add(opt_test_map[mname])
 
                 if base in ("eliminate_joins", "eliminate_ctes", "pushdown_predicates"):
-                    selected.update(executor_key_tests)
+                    file_selected.update(executor_key_tests)
 
             elif "dialects/" in fn or "parsers/" in fn or "generators/" in fn or "typing/" in fn:
                 dname = os.path.splitext(os.path.basename(fn))[0]
                 dtest_file = f"tests/dialects/test_{dname}.py"
-                selected.update(file_to_tests.get(dtest_file, ()))
+                file_selected.update(file_to_tests.get(dtest_file, ()))
                 if dname in dialect_to_opt_tests:
-                    selected.update(dialect_to_opt_tests[dname])
+                    file_selected.update(dialect_to_opt_tests[dname])
 
             elif fn == "sqlglot/serde.py":
-                selected.update(file_to_tests.get("tests/test_serde.py", ()))
-                selected.update(file_to_tests.get("tests/test_optimizer.py", ()))
-                selected.update(file_to_tests.get("tests/test_expressions.py", ()))
-                selected.update(executor_key_tests)
+                file_selected.update(file_to_tests.get("tests/test_serde.py", ()))
+                file_selected.update(file_to_tests.get("tests/test_optimizer.py", ()))
+                file_selected.update(file_to_tests.get("tests/test_expressions.py", ()))
+                file_selected.update(executor_key_tests)
 
-            elif fn in ("sqlglot/parser.py", "sqlglot/parsers/base.py"):
-                selected.update(file_to_tests.get("tests/test_parser.py", ()))
-
-            elif fn == "sqlglot/generator.py":
-                selected.update(file_to_tests.get("tests/test_generator.py", ()))
+            elif fn.startswith("sqlglot/expressions/"):
+                file_selected.update(file_to_tests.get("tests/test_expressions.py", ()))
 
             elif fn in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py"):
-                selected.update(file_to_tests.get("tests/test_tokens.py", ()))
+                file_selected.update(file_to_tests.get("tests/test_tokens.py", ()))
 
             elif fn == "sqlglot/transforms.py":
-                selected.update(file_to_tests.get("tests/test_transforms.py", ()))
+                file_selected.update(file_to_tests.get("tests/test_transforms.py", ()))
+
+            elif fn == "sqlglot/diff.py":
+                file_selected.update(file_to_tests.get("tests/test_diff.py", ()))
+
+            elif fn == "sqlglot/schema.py":
+                file_selected.update(file_to_tests.get("tests/test_schema.py", ()))
+
+            elif fn == "sqlglot/lineage.py":
+                file_selected.update(file_to_tests.get("tests/test_lineage.py", ()))
+
+            elif fn == "sqlglot/jsonpath.py":
+                file_selected.update(file_to_tests.get("tests/test_jsonpath.py", ()))
+
+            elif fn == "sqlglot/anonymize.py":
+                file_selected.update(file_to_tests.get("tests/test_anonymize.py", ()))
+
+        # Safety Net: if code was modified but file_selected returned empty, run fast targeted fallback!
+        if not file_selected:
+            file_selected = get_targeted_fallback(fn, cov, fast_file_tests)
+
+        selected.update(file_selected)
 
     return selected
 
@@ -162,7 +263,34 @@ def split_lpt(test_nums: list[int], k: int, durations: dict[int, int]) -> tuple[
         loads[lightest] += durations[num]
 
     occupied = [w for w in workers if w]
-    max_load = max([sum(durations[t] for t in w) for w in occupied]) if occupied else 0
+    if not occupied:
+        return [], 0
+
+    # Local search refinement: move a test from heaviest worker to a lighter worker if it reduces max_load
+    if len(occupied) > 1:
+        loads_list = [sum(durations[t] for t in w) for w in occupied]
+        improved = True
+        while improved:
+            improved = False
+            max_idx = loads_list.index(max(loads_list))
+            max_val = loads_list[max_idx]
+
+            for test in sorted(occupied[max_idx], key=lambda t: durations[t]):
+                t_dur = durations[test]
+                for target_idx in range(len(occupied)):
+                    if target_idx == max_idx:
+                        continue
+                    if loads_list[target_idx] + t_dur < max_val:
+                        occupied[max_idx].remove(test)
+                        occupied[target_idx].append(test)
+                        loads_list[max_idx] -= t_dur
+                        loads_list[target_idx] += t_dur
+                        improved = True
+                        break
+                if improved:
+                    break
+
+    max_load = max([sum(durations[t] for t in w) for w in occupied])
     return occupied, max_load
 
 
@@ -197,6 +325,12 @@ def main() -> None:
     tests_data = json.loads(tests_file.read_text(encoding="utf-8"))["tests"]
     durations = {t["number"]: duration_milliseconds(t["seconds"]) for t in tests_data}
 
+    # Precompute fast tests per file for fallback
+    fast_file_tests = {}
+    file_to_tests = cov.get("file_to_tests", {})
+    for tf, tnums in file_to_tests.items():
+        fast_file_tests[tf] = sorted(tnums, key=lambda n: durations.get(n, 0))[:10]
+
     # 3. Process each commit patch
     commits_dir = DATA_DIR / "commits"
     patch_files = sorted(commits_dir.glob("*.patch"))
@@ -206,7 +340,7 @@ def main() -> None:
         cid = patch_path.stem
         patch_text = patch_path.read_text(encoding="utf-8")
 
-        test_nums = select_tests_for_patch(patch_text, cov, tests_data)
+        test_nums = select_tests_for_patch(patch_text, cov, fast_file_tests)
         workers = optimize_workers(sorted(list(test_nums)), durations)
 
         selected_count += len(test_nums)
