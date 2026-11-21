@@ -1,0 +1,8 @@
+sqlglot-repo/
+.venv/
+output.jsonl
+build_coverage_map.py
+blast-radius-sample.tar.gz
+__pycache__/
+*.pyc
+.DS_Store
