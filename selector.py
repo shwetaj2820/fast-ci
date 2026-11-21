@@ -188,19 +188,27 @@ def select_tests_for_patch(patch_text: str, cov: dict, fast_file_tests: dict) ->
             file_funcs = func_to_tests.get(fn, [])
 
             has_func_match = False
+            is_tokenizer = any("Tokenizer" in l for l in dlines) or "Tokenizer" in patch_text
             for old_start, old_len, new_start, new_len in hunks:
-                # Direct lines hit around hunk
-                for l in range(old_start - 2, old_start + max(old_len, 1) + 3):
-                    file_selected.update(file_lines.get(str(l), ()))
+                hunk_tests = set()
+                # Direct lines hit around hunk (+- 1 line)
+                for l in range(old_start - 1, old_start + max(old_len, 1) + 2):
+                    hunk_tests.update(file_lines.get(str(l), ()))
 
-                # Smallest enclosing function (sorted by span ascending)
+                # Enclosing function check (sorted by span ascending)
                 hunk_start = old_start
                 hunk_end = old_start + (max(old_len, 1) - 1 if old_len > 0 else 1)
+                func_tests = set()
                 for f_info in file_funcs:
                     if not (hunk_end < f_info["start"] or hunk_start > f_info["end"]):
-                        file_selected.update(f_info["tests"])
+                        func_tests.update(f_info["tests"])
                         has_func_match = True
                         break
+
+                if hunk_tests:
+                    file_selected.update(hunk_tests)
+                elif func_tests:
+                    file_selected.update(func_tests)
 
             # Structural dependency mappings
             if fn.startswith("sqlglot/optimizer/"):
@@ -215,13 +223,13 @@ def select_tests_for_patch(patch_text: str, cov: dict, fast_file_tests: dict) ->
                 if base in ("eliminate_joins", "eliminate_ctes", "pushdown_predicates"):
                     file_selected.update(executor_key_tests)
 
-            elif "dialects/" in fn or "parsers/" in fn or "generators/" in fn or "typing/" in fn:
+            elif ("dialects/" in fn or "parsers/" in fn or "generators/" in fn or "typing/" in fn) and fn != "sqlglot/dialects/dialect.py":
                 dname = os.path.splitext(os.path.basename(fn))[0]
                 dtest_file = f"tests/dialects/test_{dname}.py"
                 file_selected.update(file_to_tests.get(dtest_file, ()))
-                # If modified lines didn't hit any inner function (e.g. class attribute like WEEK_OFFSET),
+                # If modified lines didn't hit an inner function and not tokenizer (e.g. class attribute like WEEK_OFFSET),
                 # or if it's a dialect-level parser, include optimizer tests that exercise this dialect
-                if not has_func_match or "parsers/" in fn:
+                if (not has_func_match and not is_tokenizer) or "parsers/" in fn:
                     if dname in dialect_to_opt_tests:
                         file_selected.update(dialect_to_opt_tests[dname])
 
