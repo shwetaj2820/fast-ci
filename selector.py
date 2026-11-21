@@ -53,6 +53,12 @@ def is_pure_comment_or_whitespace(files: dict) -> bool:
         return True
 
     for fn, (hunks, dlines) in files.items():
+        # Non-code files (documentation, markdown, configs) never break tests
+        if any(fn.endswith(ext) for ext in (".md", ".rst", ".txt", ".yml", ".yaml", ".json", ".lock")):
+            continue
+        if fn.startswith(".github/") or fn.startswith(".git") or fn in ("LICENSE", "NOTICE"):
+            continue
+
         if not fn.endswith(".py"):
             return False
 
@@ -181,6 +187,7 @@ def select_tests_for_patch(patch_text: str, cov: dict, fast_file_tests: dict) ->
             file_lines = line_to_tests.get(fn, {})
             file_funcs = func_to_tests.get(fn, [])
 
+            has_func_match = False
             for old_start, old_len, new_start, new_len in hunks:
                 # Direct lines hit around hunk
                 for l in range(old_start - 2, old_start + max(old_len, 1) + 3):
@@ -192,6 +199,7 @@ def select_tests_for_patch(patch_text: str, cov: dict, fast_file_tests: dict) ->
                 for f_info in file_funcs:
                     if not (hunk_end < f_info["start"] or hunk_start > f_info["end"]):
                         file_selected.update(f_info["tests"])
+                        has_func_match = True
                         break
 
             # Structural dependency mappings
@@ -200,7 +208,7 @@ def select_tests_for_patch(patch_text: str, cov: dict, fast_file_tests: dict) ->
                 if base in fix_to_opt_test and fix_to_opt_test[base] is not None:
                     file_selected.add(fix_to_opt_test[base])
 
-                for mname in ("test_optimize", "test_tpch", "test_tpcds"):
+                for mname in ("test_canonicalize", "test_optimize", "test_tpch", "test_tpcds"):
                     if mname in opt_test_map:
                         file_selected.add(opt_test_map[mname])
 
@@ -211,13 +219,15 @@ def select_tests_for_patch(patch_text: str, cov: dict, fast_file_tests: dict) ->
                 dname = os.path.splitext(os.path.basename(fn))[0]
                 dtest_file = f"tests/dialects/test_{dname}.py"
                 file_selected.update(file_to_tests.get(dtest_file, ()))
-                if dname in dialect_to_opt_tests:
-                    file_selected.update(dialect_to_opt_tests[dname])
+                # If modified lines didn't hit any inner function (e.g. class attribute like WEEK_OFFSET),
+                # or if it's a dialect-level parser, include optimizer tests that exercise this dialect
+                if not has_func_match or "parsers/" in fn:
+                    if dname in dialect_to_opt_tests:
+                        file_selected.update(dialect_to_opt_tests[dname])
 
             elif fn == "sqlglot/serde.py":
                 file_selected.update(file_to_tests.get("tests/test_serde.py", ()))
                 file_selected.update(file_to_tests.get("tests/test_optimizer.py", ()))
-                file_selected.update(file_to_tests.get("tests/test_expressions.py", ()))
                 file_selected.update(executor_key_tests)
 
             elif fn.startswith("sqlglot/expressions/"):
